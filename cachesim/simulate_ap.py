@@ -110,6 +110,18 @@ def get_parser():
                         help="episode or all")
     parser.add_argument("--prefetcher-model-path",
                         help="Set the file that stores the prefetch policy's model")
+    parser.add_argument("--dt-slru-tau", type=float, default=0.0,
+                        help="DT-SLRU promotion threshold (DT per byte).")
+    parser.add_argument("--dt-slru-protected-frac", type=float, default=0.25,
+                        help="Maximum fraction of cache reserved for DT-SLRU protected segment.")
+    parser.add_argument("--ede-alpha", type=float, default=0.5,
+                        help="EWMA coefficient for Episode-Deadline Eviction time-to-idle updates.")
+    parser.add_argument("--ede-protected-cap", type=float, default=0.2,
+                        help="Maximum fraction of cache reserved for protected items in EDE.")
+    parser.add_argument("--ede-protected-threshold", type=float, default=0.0,
+                        help="DT per byte threshold for adding items to the EDE protected list.")
+    parser.add_argument("--ede-default-tti", type=float, default=3600.0,
+                        help="Fallback time-to-idle (seconds) when EDE lacks history.")
     parser.add_argument("--early-evict",
                         help="Early eviction decisions")
     parser.add_argument("--prefetch",

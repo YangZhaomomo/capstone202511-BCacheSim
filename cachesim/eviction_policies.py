@@ -118,7 +118,7 @@ class TTLPolicy(EvictionImpl):
         self.items[key] = item
         self.pqueue[key] = item.ts_expire
 
-    def touch(self, key):
+    def touch(self, key, ts=None, **_):
         """Update priority in pq"""
         if self.pqueue[key] != self.items[key].ts_expire:
             self.pqueue.updateitem(key, self.items[key].ts_expire)
@@ -136,6 +136,208 @@ class TTLPolicy(EvictionImpl):
         return None
 
 
+class DTSLRUPolicy(EvictionImpl):
+    """Two-segment SLRU with DT-aware promotion."""
+
+    def __init__(self, cache_size, *, promotion_threshold=0.0, protected_fraction=0.25):
+        self.items = {}
+        self.segment = {}
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        self.cache_size = cache_size
+        self.promotion_threshold = promotion_threshold
+        protected_fraction = max(0.0, min(1.0, protected_fraction))
+        self.protected_limit = max(0, int(round(cache_size * protected_fraction)))
+
+    def admit(self, key, item):
+        self.items[key] = item
+        self.segment[key] = 'probation'
+        self.probation[key] = item
+        item.stats['dt_slru_segment'] = 'probation'
+
+    def _demote_if_needed(self):
+        while self.protected_limit >= 0 and len(self.protected) > self.protected_limit:
+            demote_key, demote_item = self.protected.popitem(last=False)
+            self.segment[demote_key] = 'probation'
+            self.probation[demote_key] = demote_item
+
+    def _maybe_promote(self, key):
+        if self.segment.get(key) != 'probation':
+            return
+        item = self.probation.pop(key)
+        dt_per_byte = item.stats.get('dt_per_byte', 0.0)
+        hits = item.hits
+        promote = (hits >= 2) or (dt_per_byte >= self.promotion_threshold)
+        if promote and self.protected_limit != 0:
+            self.segment[key] = 'protected'
+            self.protected[key] = item
+            item.stats['dt_slru_segment'] = 'protected'
+            self._demote_if_needed()
+        else:
+            # keep in probation but move to MRU
+            self.segment[key] = 'probation'
+            self.probation[key] = item
+            item.stats['dt_slru_segment'] = 'probation'
+
+    def touch(self, key, ts=None, **kwargs):
+        if key not in self.items:
+            return
+        segment = self.segment.get(key)
+        if segment == 'probation':
+            self._maybe_promote(key)
+        else:
+            item = self.protected.pop(key, None)
+            if item is not None:
+                self.protected[key] = item
+                item.stats['dt_slru_segment'] = 'protected'
+
+    def evict(self, key=None):
+        if key is None:
+            if self.probation:
+                key, item = self.probation.popitem(last=False)
+            elif self.protected:
+                key, item = self.protected.popitem(last=False)
+            else:
+                raise KeyError("Attempting to evict from empty cache")
+        else:
+            segment = self.segment.get(key)
+            if segment == 'probation':
+                item = self.probation.pop(key)
+            elif segment == 'protected':
+                item = self.protected.pop(key)
+            else:
+                raise KeyError(key)
+        self.segment.pop(key, None)
+        self.items.pop(key, None)
+        return key, item
+
+    def victim(self):
+        if self.probation:
+            return next(iter(self.probation))
+        if self.protected:
+            return next(iter(self.protected))
+        return None
+
+
+class EpisodeDeadlinePolicy(EvictionImpl):
+    """Predicts expiry using EWMA time-to-idle with protected DT-per-byte segment."""
+
+    def __init__(self, cache_size, *, alpha=0.5, protected_cap=0.2,
+                 protected_threshold=0.0, default_tti=3600.0):
+        self.items = {}
+        self.state = {}
+        self.protected = OrderedDict()
+        self.unprotected_queue = pqdict.pqdict()
+        self.cache_size = cache_size
+        self.alpha = min(max(alpha, 0.0), 1.0)
+        self.default_tti = max(default_tti, 1.0)
+        protected_cap = max(0.0, min(1.0, protected_cap))
+        self.protected_limit = max(0, int(round(cache_size * protected_cap)))
+        self.protected_threshold = protected_threshold
+
+    def _current_expiry(self, key, item, state):
+        expire = state.get('expire')
+        if expire is None:
+            expire = item.last_access_time.physical + state.get('predicted_tti', self.default_tti)
+        return expire
+
+    def _promote_to_protected(self, key, item, state):
+        if self.protected_limit == 0:
+            return
+        if key in self.unprotected_queue:
+            del self.unprotected_queue[key]
+        self.protected.pop(key, None)
+        self.protected[key] = item
+        state['protected'] = True
+        self._enforce_protected_cap()
+
+    def _enforce_protected_cap(self):
+        while self.protected_limit >= 0 and len(self.protected) > self.protected_limit:
+            demote_key, demote_item = self.protected.popitem(last=False)
+            demote_state = self.state.get(demote_key)
+            if demote_state is None:
+                continue
+            demote_state['protected'] = False
+            expire = self._current_expiry(demote_key, demote_item, demote_state)
+            self.unprotected_queue[demote_key] = expire
+
+    def _should_protect(self, dt_per_byte):
+        return self.protected_limit > 0 and dt_per_byte >= self.protected_threshold
+
+    def admit(self, key, item):
+        predicted_tti = float(max(item.stats.get('ede_predicted_tti', self.default_tti), 1.0))
+        state = {
+            'predicted_tti': predicted_tti,
+            'protected': False,
+            'last_access_physical': item.last_access_time.physical,
+        }
+        item.stats['ede_predicted_tti'] = predicted_tti
+        self.items[key] = item
+        self.state[key] = state
+        dt_per_byte = item.stats.get('dt_per_byte', 0.0)
+        expire = item.last_access_time.physical + predicted_tti
+        state['expire'] = expire
+        if self._should_protect(dt_per_byte):
+            self._promote_to_protected(key, item, state)
+        else:
+            self.unprotected_queue[key] = expire
+
+    def touch(self, key, ts=None, **kwargs):
+        if key not in self.items:
+            return
+        item = self.items[key]
+        state = self.state[key]
+        if ts is not None:
+            prev = state.get('last_access_physical', item.last_access_time.physical)
+            delta = max(ts.physical - prev, 0)
+            predicted = state.get('predicted_tti', self.default_tti)
+            if delta > 0 or self.alpha > 0:
+                predicted = self.alpha * max(delta, 1.0) + (1.0 - self.alpha) * predicted
+            state['predicted_tti'] = max(predicted, 1.0)
+            state['last_access_physical'] = ts.physical
+            state['expire'] = ts.physical + state['predicted_tti']
+            item.stats['ede_predicted_tti'] = state['predicted_tti']
+        expire = state.get('expire', item.last_access_time.physical + state['predicted_tti'])
+
+        if state.get('protected'):
+            # maintain MRU within protected set
+            self.protected.pop(key, None)
+            self.protected[key] = item
+        else:
+            if key in self.unprotected_queue:
+                self.unprotected_queue.updateitem(key, expire)
+            else:
+                self.unprotected_queue[key] = expire
+            dt_per_byte = item.stats.get('dt_per_byte', 0.0)
+            if self._should_protect(dt_per_byte):
+                self._promote_to_protected(key, item, state)
+
+    def evict(self, key=None):
+        if key is None:
+            if self.unprotected_queue:
+                key, _ = self.unprotected_queue.popitem()
+            elif self.protected:
+                key, _ = self.protected.popitem(last=False)
+            else:
+                raise KeyError("Attempting to evict from empty cache")
+        else:
+            if key in self.unprotected_queue:
+                del self.unprotected_queue[key]
+            if key in self.protected:
+                self.protected.pop(key)
+        item = self.items.pop(key)
+        state = self.state.pop(key, None)
+        return key, item
+
+    def victim(self):
+        if self.unprotected_queue:
+            key, _ = self.unprotected_queue.topitem()
+            return key
+        if self.protected:
+            return next(iter(self.protected))
+        return None
+
+
 class LRUPolicy(EvictionImpl):
     def __init__(self):
         self.items = OrderedDict()
@@ -143,7 +345,7 @@ class LRUPolicy(EvictionImpl):
     def admit(self, key, item):
         self.items[key] = item
 
-    def touch(self, key):
+    def touch(self, key, ts=None, **_):
         # Moves to end. We evict from start.
         self.items.move_to_end(key)
 
@@ -641,9 +843,27 @@ class QueueCache(EvictionPolicy):
         early_evict = options.early_evict
         prefetch = options.prefetch
 
+        self.options = options
+        policy_name = (options.eviction_policy or 'lru').lower()
         self.lru = lru
-        if options.eviction_policy and options.eviction_policy.startswith('ttl'):
+        if policy_name.startswith('ttl'):
             self.cache = TTLPolicy()
+        elif policy_name in ('dt-slru', 'dt_slru', 'dtslru'):
+            self.cache = DTSLRUPolicy(
+                num_elems,
+                promotion_threshold=getattr(options, 'dt_slru_tau', 0.0),
+                protected_fraction=getattr(options, 'dt_slru_protected_frac', 0.25),
+            )
+            self.lru = False
+        elif policy_name in ('ede', 'episode-deadline', 'episode_deadline'):
+            self.cache = EpisodeDeadlinePolicy(
+                num_elems,
+                alpha=getattr(options, 'ede_alpha', 0.5),
+                protected_cap=getattr(options, 'ede_protected_cap', 0.2),
+                protected_threshold=getattr(options, 'ede_protected_threshold', 0.0),
+                default_tti=getattr(options, 'ede_default_tti', 3600.0),
+            )
+            self.lru = False
         else:
             self.cache = LRUPolicy()
         self.block_counts = Counter()
@@ -679,12 +899,82 @@ class QueueCache(EvictionPolicy):
             self.ttl_predicter = TTLModel(options)
         elif options.eviction_policy == 'ttl-opt':
             self.ttl_predicter = TTLOpt()
-        elif not options.eviction_policy.startswith('LRU'):
+        elif policy_name.startswith('lru'):
+            pass
+        elif policy_name in ('dt-slru', 'dt_slru', 'dtslru', 'ede', 'episode-deadline', 'episode_deadline'):
+            pass
+        else:
             raise NotImplementedError(options.eviction_policy)
 
         self.on_evict = on_evict
         self.insert_metadata = {}
         self.keep_metadata = keep_metadata
+
+    @staticmethod
+    def _to_seconds(value):
+        if isinstance(value, Timestamp):
+            return value.physical
+        if hasattr(value, 'physical'):
+            return value.physical
+        if value is None:
+            return 0.0
+        return float(value)
+
+    def _extract_service_time_saved(self, episode):
+        if episode is None:
+            return 0.0
+        candidates = []
+        if getattr(episode, 's_export', None):
+            candidates.extend([
+                episode.s_export.get('prefetch_st_benefit'),
+                episode.s_export.get('service_time_saved__noprefetch'),
+                episode.s_export.get('service_time_saved__prefetch'),
+            ])
+        if getattr(episode, 's', None):
+            candidates.extend([
+                episode.s.get('prefetch_st_benefit'),
+                episode.s.get('service_time_saved__noprefetch'),
+                episode.s.get('service_time_saved__prefetch'),
+                episode.s.get('service_time_saved'),
+            ])
+        for cand in candidates:
+            if cand is not None:
+                return float(cand)
+        return 0.0
+
+    def _initial_tti(self, episode):
+        default_tti = getattr(self.options, 'ede_default_tti', 3600.0)
+        if episode is None:
+            return default_tti
+        num_accesses = getattr(episode, 'num_accesses', None) or 0
+        span = self._to_seconds(getattr(episode, 'timespan_phys', 0.0))
+        if num_accesses and num_accesses > 1 and span > 0:
+            return max(span / num_accesses, 1.0)
+        max_ia = getattr(episode, 'max_interarrival', None)
+        if max_ia:
+            seconds = self._to_seconds(max_ia)
+            if seconds > 0:
+                return max(seconds, 1.0)
+        return default_tti
+
+    def _enrich_item_metadata(self, metadata):
+        episode = metadata.get('episode')
+        size_units = metadata.get('size')
+        if size_units is None and getattr(episode, 'num_chunks', None):
+            size_units = episode.num_chunks
+        size_units = size_units if size_units else 1.0
+        size_bytes = max(size_units, 1e-6) * 4 * 1024 * 1024
+        dt_saved = metadata.get('dt_score')
+        if dt_saved is None:
+            dt_saved = self._extract_service_time_saved(episode)
+        dt_per_byte = metadata.get('dt_per_byte')
+        if dt_per_byte is None:
+            dt_per_byte = dt_saved / size_bytes if size_bytes else 0.0
+        metadata['dt_score'] = dt_saved
+        metadata['dt_per_byte'] = dt_per_byte
+        if 'ede_predicted_tti' not in metadata:
+            metadata['ede_predicted_tti'] = self._initial_tti(episode)
+        return metadata
 
     def incr_episode(self, key, ts, *, admit_buffer=False):
         if "--fast" in sys.argv:
@@ -802,8 +1092,11 @@ class QueueCache(EvictionPolicy):
             elif touch:
                 self.cache[key].touch(key_ts)
 
-            # promote by removing and reinserting at the head.
-            if self.lru:
+            # notify policy of access for bookkeeping/promotions.
+            try:
+                self.cache.touch(key, key_ts, count_as_hit=count_as_hit)
+            except TypeError:
+                # Backwards compatibility for policies that ignore extra args.
                 self.cache.touch(key)
         if not check_only:
             self.bump("queries")
@@ -909,6 +1202,7 @@ class QueueCache(EvictionPolicy):
                     self.bump("total_ttl", v=int(ttl))
                     # assert ttl is not None
                     # TODO: Log average TTL
+                item_kwargs = self._enrich_item_metadata(item_kwargs)
                 # ttl = ttl * 1.25
                 # ttl = min(ttl, 3600*2)
                 self.admit(nkey, ts, ts_access=ts_access, ttl=ttl, **item_kwargs)
@@ -920,6 +1214,7 @@ class QueueCache(EvictionPolicy):
         self.admit_buffer_metadata.clear()
 
     def admit(self, key, ts, *, ttl=None, ts_access=None, episode=None, **item_kwargs):
+        item_kwargs = self._enrich_item_metadata(item_kwargs)
         block_id, chunk_id = key
         if self.block_counts.get(block_id, 0) == 0:
             self.bump("episodes_admitted2")
