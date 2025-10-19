@@ -1,11 +1,11 @@
 from collections import Counter
 from collections import defaultdict
 from collections import OrderedDict
-import pqdict
 import itertools
 import sys
 
 import numpy as np
+import pqdict
 try:
     import lightgbm as lgb
 except ModuleNotFoundError:
@@ -220,7 +220,7 @@ class DTSLRUPolicy(EvictionImpl):
 
 
 class EpisodeDeadlinePolicy(EvictionImpl):
-    """Predicts expiry using EWMA time-to-idle with protected DT-per-byte segment."""
+    """Predicts expiry using time-to-idle estimates while protecting high DT items."""
 
     def __init__(self, cache_size, *, alpha=0.5, protected_cap=0.2,
                  protected_threshold=0.0, default_tti=3600.0):
@@ -231,38 +231,56 @@ class EpisodeDeadlinePolicy(EvictionImpl):
         self.cache_size = cache_size
         self.alpha = min(max(alpha, 0.0), 1.0)
         self.default_tti = max(default_tti, 1.0)
-        protected_cap = max(0.0, min(1.0, protected_cap))
-        self.protected_limit = max(0, int(round(cache_size * protected_cap)))
+        self.protected_cap = max(0.0, min(1.0, protected_cap))
         self.protected_threshold = protected_threshold
 
-    def _current_expiry(self, key, item, state):
-        expire = state.get('expire')
-        if expire is None:
-            expire = item.last_access_time.physical + state.get('predicted_tti', self.default_tti)
-        return expire
+    def __len__(self):
+        return len(self.state)
 
-    def _promote_to_protected(self, key, item, state):
-        if self.protected_limit == 0:
-            return
+    def __contains__(self, key):
+        return key in self.items or key in self.protected
+
+    def keys(self):
+        return list(self.state.keys())
+
+    def __getitem__(self, key):
+        if key in self.items:
+            return self.items[key]
+        if key in self.protected:
+            return self.protected[key]
+        raise KeyError(key)
+
+    def _protected_limit(self):
+        if self.protected_cap <= 0:
+            return 0
+        total = len(self.items) + len(self.protected)
+        if total <= 0:
+            return 0
+        limit = int(round(total * self.protected_cap))
+        return max(limit, 1)
+
+    def _should_protect(self, dt_per_byte):
+        return self.protected_cap > 0 and dt_per_byte >= self.protected_threshold
+
+    def _promote(self, key, item, state):
         if key in self.unprotected_queue:
             del self.unprotected_queue[key]
+        self.items.pop(key, None)
         self.protected.pop(key, None)
         self.protected[key] = item
         state['protected'] = True
         self._enforce_protected_cap()
 
     def _enforce_protected_cap(self):
-        while self.protected_limit >= 0 and len(self.protected) > self.protected_limit:
+        limit = self._protected_limit()
+        while limit >= 0 and len(self.protected) > limit:
             demote_key, demote_item = self.protected.popitem(last=False)
             demote_state = self.state.get(demote_key)
-            if demote_state is None:
-                continue
-            demote_state['protected'] = False
-            expire = self._current_expiry(demote_key, demote_item, demote_state)
-            self.unprotected_queue[demote_key] = expire
-
-    def _should_protect(self, dt_per_byte):
-        return self.protected_limit > 0 and dt_per_byte >= self.protected_threshold
+            if demote_state:
+                demote_state['protected'] = False
+                expire = demote_state.get('expire', demote_item.last_access_time.physical + demote_state.get('predicted_tti', self.default_tti))
+                self.unprotected_queue[demote_key] = expire
+                self.items[demote_key] = demote_item
 
     def admit(self, key, item):
         predicted_tti = float(max(item.stats.get('ede_predicted_tti', self.default_tti), 1.0))
@@ -275,32 +293,47 @@ class EpisodeDeadlinePolicy(EvictionImpl):
         self.items[key] = item
         self.state[key] = state
         dt_per_byte = item.stats.get('dt_per_byte', 0.0)
+        if dt_per_byte <= 0:
+            size = item.stats.get('size_bytes', 1.0)
+            score = max(item.stats.get('dt_score', 0.0), 1.0)
+            dt_per_byte = score / max(size, 1.0)
         expire = item.last_access_time.physical + predicted_tti
         state['expire'] = expire
         if self._should_protect(dt_per_byte):
-            self._promote_to_protected(key, item, state)
+            self._promote(key, item, state)
         else:
             self.unprotected_queue[key] = expire
+        self._enforce_protected_cap()
 
     def touch(self, key, ts=None, **kwargs):
-        if key not in self.items:
-            return
-        item = self.items[key]
-        state = self.state[key]
+        item = self.items.get(key)
+        state = self.state.get(key)
+        if item is None or state is None:
+            item = self.protected.get(key)
+            state = self.state.get(key)
+            if item is None or state is None:
+                return
+        prev = state.get('last_access_physical', item.last_access_time.physical)
         if ts is not None:
-            prev = state.get('last_access_physical', item.last_access_time.physical)
-            delta = max(ts.physical - prev, 0)
-            predicted = state.get('predicted_tti', self.default_tti)
-            if delta > 0 or self.alpha > 0:
-                predicted = self.alpha * max(delta, 1.0) + (1.0 - self.alpha) * predicted
-            state['predicted_tti'] = max(predicted, 1.0)
+            delta = max(ts.physical - prev, 0.0)
+        else:
+            delta = max(item.last_access_time.physical - prev, 0.0)
+        if delta <= 0:
+            delta = 1.0
+        predicted = state.get('predicted_tti', self.default_tti)
+        predicted = self.alpha * delta + (1.0 - self.alpha) * predicted
+        predicted = max(predicted, 1.0)
+        state['predicted_tti'] = predicted
+        if ts is not None:
             state['last_access_physical'] = ts.physical
-            state['expire'] = ts.physical + state['predicted_tti']
-            item.stats['ede_predicted_tti'] = state['predicted_tti']
-        expire = state.get('expire', item.last_access_time.physical + state['predicted_tti'])
+            expire = ts.physical + predicted
+        else:
+            state['last_access_physical'] = item.last_access_time.physical
+            expire = item.last_access_time.physical + predicted
+        state['expire'] = expire
+        item.stats['ede_predicted_tti'] = predicted
 
         if state.get('protected'):
-            # maintain MRU within protected set
             self.protected.pop(key, None)
             self.protected[key] = item
         else:
@@ -309,8 +342,12 @@ class EpisodeDeadlinePolicy(EvictionImpl):
             else:
                 self.unprotected_queue[key] = expire
             dt_per_byte = item.stats.get('dt_per_byte', 0.0)
+            if dt_per_byte <= 0:
+                size = item.stats.get('size_bytes', 1.0)
+                score = max(item.stats.get('dt_score', 0.0), 1.0)
+                dt_per_byte = score / max(size, 1.0)
             if self._should_protect(dt_per_byte):
-                self._promote_to_protected(key, item, state)
+                self._promote(key, item, state)
 
     def evict(self, key=None):
         if key is None:
@@ -325,8 +362,10 @@ class EpisodeDeadlinePolicy(EvictionImpl):
                 del self.unprotected_queue[key]
             if key in self.protected:
                 self.protected.pop(key)
-        item = self.items.pop(key)
-        state = self.state.pop(key, None)
+        item = self.items.pop(key, None)
+        if item is None:
+            item = self.protected.pop(key, None)
+        self.state.pop(key, None)
         return key, item
 
     def victim(self):
@@ -964,9 +1003,12 @@ class QueueCache(EvictionPolicy):
             size_units = episode.num_chunks
         size_units = size_units if size_units else 1.0
         size_bytes = max(size_units, 1e-6) * 4 * 1024 * 1024
+        metadata['size_bytes'] = size_bytes
         dt_saved = metadata.get('dt_score')
         if dt_saved is None:
             dt_saved = self._extract_service_time_saved(episode)
+        if dt_saved is None or dt_saved <= 0:
+            dt_saved = 1.0
         dt_per_byte = metadata.get('dt_per_byte')
         if dt_per_byte is None:
             dt_per_byte = dt_saved / size_bytes if size_bytes else 0.0
@@ -1357,3 +1399,18 @@ class QueueCache(EvictionPolicy):
 
         if self.keep_metadata:
             del self.insert_metadata[evicted[1].key]
+    def __len__(self):
+        return len(self.items) + len(self.protected)
+
+    def __contains__(self, key):
+        return key in self.items or key in self.protected
+
+    def keys(self):
+        return list(self.items.keys()) + list(self.protected.keys())
+
+    def __getitem__(self, key):
+        if key in self.items:
+            return self.items[key]
+        if key in self.protected:
+            return self.protected[key]
+        raise KeyError(key)
