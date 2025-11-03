@@ -1008,7 +1008,10 @@ class QueueCache(EvictionPolicy):
         if dt_saved is None:
             dt_saved = self._extract_service_time_saved(episode)
         if dt_saved is None or dt_saved <= 0:
-            dt_saved = 1.0
+            if episode and getattr(episode, 'num_accesses', 0):
+                dt_saved = float(episode.num_accesses)
+            else:
+                dt_saved = 10.0
         dt_per_byte = metadata.get('dt_per_byte')
         if dt_per_byte is None:
             dt_per_byte = dt_saved / size_bytes if size_bytes else 0.0
